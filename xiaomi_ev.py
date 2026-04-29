@@ -17,12 +17,15 @@ SID = "iccc_app_api"
 CALLBACK = f"{ICCC_BASE}/sts"
 
 UA_HTTP = "okhttp/3.14.9"
+APP_VERSION = "2.3.25"
+APP_VERSION_CODE = "26040914"
+ANDROID_SDK = "36"
 
 _DEVICES = [
     ("2210132C",   "Xiaomi 13 Pro",  "13", "TQ2A.230505.002"),
     ("23127PN0CC",  "Xiaomi 14",      "14", "UQ1A.240105.004"),
     ("2312DRA49G",  "Xiaomi 14 Pro",  "14", "UQ1A.240105.004"),
-    ("25020PN94G",  "Xiaomi 15",      "15", "AQ3A.240827.001"),
+    ("25128PNA1C",  "Xiaomi 15 Ultra","15", "BP2A.250605.031.A3"),
 ]
 
 
@@ -164,6 +167,24 @@ def qr_login() -> dict:
     }
 
 
+def get_device_list(auth: dict) -> list[dict]:
+    """Query Xiaomi account device list to find phone's real deviceId."""
+    s = _login_session()
+    s.cookies.set("passToken", auth["passToken"], domain="account.xiaomi.com")
+    s.cookies.set("userId", auth["userId"], domain="account.xiaomi.com")
+    s.cookies.set("deviceId", auth["deviceId"], domain="account.xiaomi.com")
+
+    r = s.get("https://account.xiaomi.com/v3/device/user/list", params={
+        "userId": auth["userId"],
+        "page": 1,
+        "pageSize": 20,
+        "_locale": "zh_CN",
+    })
+    r.raise_for_status()
+    data = _parse(r.text)
+    return data.get("data", {}).get("records", [])
+
+
 def refresh_service_token(auth: dict) -> dict:
     """
     Refresh serviceToken using stored passToken.
@@ -242,21 +263,34 @@ def get_auth() -> dict:
 # ---------------------------------------------------------------------------
 
 def _api(path: str, body: dict, auth: dict) -> dict:
+    code, _, _, build = _DEVICES[-1]
     r = requests.post(
         ICCC_BASE + path,
         json=body,
         cookies={
-            "xmuuid": auth["xmuuid"],
-            "mobileId": auth["mobileId"],
             "serviceToken": auth["serviceToken"],
             "cUserId": auth["cUserId"],
-            "iccc_app_api_ph": auth["iccc_app_api_ph"],
-            "iccc_app_api_slh": auth["iccc_app_api_slh"],
+            "ph": auth["iccc_app_api_ph"],
+            "slh": auth["iccc_app_api_slh"],
             "ssecurity": auth["ssecurity"],
         },
         headers={
             "User-Agent": UA_HTTP,
             "accept": "application/json, text/plain, */*",
+            "accept-language": "zh-CN",
+            "content-type": "application/json; charset=UTF-8",
+            "request-source": "app",
+            "mobileid": auth["mobileId"],
+            "deviceostype": "android",
+            "devicevendor": "Xiaomi",
+            "devicemodel": code,
+            "deviceosversion": build,
+            "androidsdkversion": ANDROID_SDK,
+            "deviceappversion": APP_VERSION,
+            "deviceappversionname": APP_VERSION,
+            "deviceappversioncode": APP_VERSION_CODE,
+            "devicereleasechannel": "1",
+            "devicepackagetype": "1",
         },
     )
     r.raise_for_status()
@@ -296,6 +330,37 @@ def get_data_page(auth: dict, vid: str, page: int = 1, page_size: int = 20) -> d
     return _api("/trip/dataPage", {"vid": vid, "page": page, "pageSize": page_size}, auth)
 
 
+def get_car_list(auth: dict) -> list[dict]:
+    """Return owned cars with vid, vin, carModel, carPlate."""
+    code, _, _, build = _DEVICES[-1]
+    resp = _api("/clientbusiness/IcccUserAuthService/getUserCarListV2", {
+        "viewList": ["SIDE_VIEW_DARK", "TOP_VIEW_DARK", "OBLIQUE_VIEW_HALF"],
+        "deviceAppVersion": APP_VERSION,
+        "deviceModel": code,
+        "deviceOsType": "android",
+        "deviceOsVersion": build,
+        "deviceVendor": "Xiaomi",
+    }, auth)
+    data = resp.get("data", {})
+    return data.get("ownCarList", []) + data.get("authorizedCarList", [])
+
+
+def login_device(auth: dict) -> None:
+    """Register this device session with ICCC — must be called before car/trip APIs."""
+    code, _, _, build = _DEVICES[-1]
+    _api("/clientbusiness/IcccUserDeviceService/loginDevice", {
+        "infoBoxGroups": ["interact", "notice", "car", "chosen"],
+        "pushType": "",
+        "regId": "",
+        "supportDuration": 1,
+        "deviceAppVersion": APP_VERSION,
+        "deviceModel": code,
+        "deviceOsType": "android",
+        "deviceOsVersion": build,
+        "deviceVendor": "Xiaomi",
+    }, auth)
+
+
 # ---------------------------------------------------------------------------
 # CLI demo
 # ---------------------------------------------------------------------------
@@ -303,12 +368,23 @@ def get_data_page(auth: dict, vid: str, page: int = 1, page_size: int = 20) -> d
 if __name__ == "__main__":
     import os
     import sys
-    from datetime import date
 
     vid = os.environ.get("XIAOMI_VID", "")
-    if not vid:
-        print("Error: set XIAOMI_VID to your vehicle VIN")
-        sys.exit(1)
+
+    if "--devices" in sys.argv:
+        stored = load_auth()
+        if not stored:
+            print("No saved session found. Run without --devices first to login.")
+            sys.exit(1)
+        try:
+            devices = get_device_list(stored)
+        except Exception as e:
+            print(f"[devices] Failed: {e}")
+            sys.exit(1)
+        print(f"[devices] Found {len(devices)} device(s):\n")
+        for i, d in enumerate(devices, 1):
+            print(f"  [{i}] {json.dumps(d, ensure_ascii=False, indent=4)}")
+        sys.exit(0)
 
     if "--refresh" in sys.argv:
         stored = load_auth()
@@ -334,52 +410,69 @@ if __name__ == "__main__":
         print(f"Error: {e}")
         sys.exit(1)
 
-    # List available months
-    months_resp = get_trip_months(auth, vid)
-    print("\n=== Trip months ===")
-    print(json.dumps(months_resp, ensure_ascii=False, indent=2))
-
-    # Flatten {year, months[]} list → ["YYYYMM", ...] sorted descending
-    year_entries = (months_resp.get("data") or {}).get("list") or []
-    months = [
-        f"{entry['year']}{m}"
-        for entry in reversed(year_entries)
-        for m in reversed(entry.get("months", []))
-    ]
-    if not months:
-        print("No trip data found.")
-        sys.exit(0)
-
-    latest_month = months[0]
-
-    # Show stats for the most recent month
-    stats = get_month_stats(auth, vid, latest_month)
-    if stats.get("code") != 200:
-        print(f"[warn] queryMonthStats failed: {stats}")
-    else:
-        print(f"\n=== Stats for {latest_month} ===")
-        print(json.dumps(stats, ensure_ascii=False, indent=2))
-
-    # List trips up to today
-    today = date.today().strftime("%Y%m%d")
-    trips_resp = get_trip_list(auth, vid, begin_date=today)
-    if trips_resp.get("code") != 200:
-        print(f"[warn] trip/list failed: {trips_resp}")
+    try:
+        login_device(auth)
+        print("[auth] Device session registered with ICCC")
+    except Exception as e:
+        print(f"Error registering device: {e}")
         sys.exit(1)
-    print(f"\n=== Recent trips (before {today}) ===")
-    print(json.dumps(trips_resp, ensure_ascii=False, indent=2))
 
-    # Show detail for the most recent trip
-    trips = trips_resp.get("data") or []
-    if isinstance(trips, dict):
-        trips = trips.get("list") or []
-    trip_id = None
-    for day in trips:
-        car_trips = day.get("carTripList") or []
-        if car_trips:
-            trip_id = car_trips[0].get("tripId")
-            break
-    if trip_id:
-        detail = get_trip_detail(auth, trip_id, vid)
-        print(f"\n=== Detail: {trip_id} ===")
-        print(json.dumps(detail, ensure_ascii=False, indent=2))
+    # If phone deviceId not yet selected, prompt user to pick from device list
+    if not auth.get("phoneDeviceId"):
+        try:
+            devices = get_device_list(auth)
+        except Exception as e:
+            print(f"Error fetching device list: {e}")
+            sys.exit(1)
+
+        phone_devices = [d for d in devices if d.get("deviceId", "").startswith("an_")]
+        if not phone_devices:
+            phone_devices = devices  # fallback: show all
+
+        print("[devices] 请选择手机设备 (用于鉴权):")
+        for i, d in enumerate(phone_devices, 1):
+            print(f"  [{i}] {d.get('modelName', '')}  deviceId={d.get('deviceId', '')}")
+
+        while True:
+            try:
+                choice = int(input("请输入编号: ").strip())
+                if 1 <= choice <= len(phone_devices):
+                    selected = phone_devices[choice - 1]
+                    break
+            except ValueError:
+                pass
+            print(f"  请输入 1-{len(phone_devices)} 之间的数字")
+
+        auth["deviceId"] = selected["deviceId"]
+        auth["phoneDeviceId"] = selected["deviceId"]
+        save_auth(auth)
+        print(f"[devices] 已选择 {selected.get('modelName', '')}  deviceId={auth['deviceId']}")
+
+    if not vid:
+        try:
+            cars = get_car_list(auth)
+        except Exception as e:
+            print(f"Error fetching car list: {e}")
+            sys.exit(1)
+
+        if not cars:
+            print("Error: No cars found on this account")
+            sys.exit(1)
+
+        if len(cars) == 1:
+            vid = cars[0]["vid"]
+            c = cars[0]
+            print(f"[cars] {c.get('carModel', '')} {c.get('carPlate', '')}  vid={vid}")
+        else:
+            print("[cars] 检测到多辆车，请选择:")
+            for i, c in enumerate(cars, 1):
+                print(f"  [{i}] {c.get('carModel', '')}  {c.get('carPlate', '')}  vid={c['vid']}")
+            while True:
+                try:
+                    choice = int(input("请输入编号: ").strip())
+                    if 1 <= choice <= len(cars):
+                        vid = cars[choice - 1]["vid"]
+                        break
+                except ValueError:
+                    pass
+                print(f"  请输入 1-{len(cars)} 之间的数字")
